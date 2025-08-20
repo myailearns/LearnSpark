@@ -4,6 +4,7 @@ import re
 import json
 import os
 import tempfile
+import random
 from openai import OpenAI
 
 class StudentAIApp:
@@ -643,12 +644,305 @@ class StudentAIApp:
         st.set_page_config(page_title="LearnSpark", page_icon="🎓", layout="wide")
         self.sidebar()
         self.render_header()
-        self.get_lesson_input()
 
-        if self.mode == "📖 Learn":
-            self.learn_mode()
-        elif self.mode == "📝 Exam":
-            self.exam_mode()
+        main_tabs = st.tabs(["📘 Study & Exam", "➗ Math Practice"])
+
+        with main_tabs[0]:
+            self.get_lesson_input()
+            if self.mode == "📖 Learn":
+                self.learn_mode()
+            elif self.mode == "📝 Exam":
+                self.exam_mode()
+
+        with main_tabs[1]:
+            st.subheader("➗ Math Practice")
+
+            st.markdown("Select operations, difficulty, and generate practice MCQs. No internet or AI needed.")
+
+            col_a, col_b = st.columns([2, 1])
+            with col_a:
+                ops = st.multiselect(
+                    "Operations",
+                    ["Addition (+)", "Subtraction (-)", "Multiplication (×)", "Division (÷)"],
+                    default=["Addition (+)"]
+                )
+            with col_b:
+                difficulty = st.selectbox("Difficulty", ["Easy", "Medium", "Hard"], index=0)
+
+            combine_ops = st.checkbox("Combine selected operations in one expression", value=False)
+            math_num_questions = st.number_input("How many questions?", min_value=1, max_value=20, value=5, step=1)
+            style_hint = st.text_area(
+                "Optional example/style (how you want the question to look)",
+                placeholder="e.g., Make it a word problem about apples and shopping",
+                height=60,
+            )
+            generator_mode = st.radio("Question source", ["Local (offline)", "LLM (OpenAI)"], index=0)
+
+            def pick_operand(level: str):
+                if level == "Easy":
+                    return random.randint(1, 10)
+                if level == "Medium":
+                    return random.randint(5, 50)
+                return random.randint(10, 100)
+
+            def ensure_divisible(a: int, b: int) -> tuple:
+                if b == 0:
+                    b = 1
+                a = (a // b) * b
+                if a == 0:
+                    a = b
+                return a, b
+
+            def compute(a: int, op: str, b: int) -> int:
+                if op == "+":
+                    return a + b
+                if op == "-":
+                    return a - b
+                if op == "×":
+                    return a * b
+                if op == "÷":
+                    if b == 0:
+                        return a
+                    return a // b
+                return 0
+
+            def gen_single(ops_labels, level, combine, hint) -> dict:
+                label_to_op = {
+                    "Addition (+)": "+",
+                    "Subtraction (-)": "-",
+                    "Multiplication (×)": "×",
+                    "Division (÷)": "÷",
+                }
+                available_ops = [label_to_op[o] for o in ops_labels] or ["+"]
+
+                if not combine or len(available_ops) == 1:
+                    op = random.choice(available_ops)
+                    a = pick_operand(level)
+                    b = pick_operand(level)
+                    if op == "÷":
+                        a, b = ensure_divisible(a, b)
+                    correct = compute(a, op, b)
+                    q_text = f"Compute: {a} {op} {b}"
+                else:
+                    op1 = random.choice(available_ops)
+                    op2 = random.choice(available_ops)
+                    a = pick_operand(level)
+                    b = pick_operand(level)
+                    c = pick_operand(level)
+                    if op1 == "÷":
+                        a, b = ensure_divisible(a, b)
+                    if op2 == "÷":
+                        ab = compute(a, op1, b)
+                        ab, c = ensure_divisible(ab, c)
+                    ab = compute(a, op1, b)
+                    correct = compute(ab, op2, c)
+                    q_text = f"Compute: ({a} {op1} {b}) {op2} {c}"
+
+                if hint:
+                    q_text = f"{hint.strip()}\n{q_text}"
+
+                # Generate distractors
+                distractors = set()
+                tweaks = [-2, -1, 1, 2, 3, -3]
+                # Wrong precedence for combined expressions (if applicable)
+                if combine and len(available_ops) > 1:
+                    # Attempt precedence-based wrong answer: a op1 (b op2 c)
+                    try:
+                        if op2 == "÷":
+                            bc_a = b
+                            bc_b = c if c != 0 else 1
+                            bc_a, bc_b = ensure_divisible(bc_a, bc_b)
+                            bc = compute(bc_a, op2, bc_b)
+                        else:
+                            bc = compute(b, op2, c)
+                        wrong_prec = compute(a, op1, bc)
+                        if wrong_prec != correct:
+                            distractors.add(wrong_prec)
+                    except Exception:
+                        pass
+                while len(distractors) < 3:
+                    off = random.choice(tweaks)
+                    cand = correct + off
+                    if cand != correct:
+                        distractors.add(cand)
+                options = [str(correct)] + [str(x) for x in list(distractors)[:3]]
+                random.shuffle(options)
+                return {
+                    "id": 0,
+                    "type": "mcq",
+                    "question": q_text,
+                    "options": options,
+                    "answer": str(correct),
+                }
+
+            def _normalize_ops_for_display(expr: str) -> str:
+                expr = expr.replace('*', '×').replace('x', '×').replace('X', '×')
+                expr = expr.replace('/', '÷').replace('÷', '÷')
+                return expr
+
+            def _normalize_ops_for_eval(expr: str) -> str:
+                expr = expr.replace('×', '*').replace('x', '*').replace('X', '*')
+                expr = expr.replace('÷', '/')
+                return expr
+
+            def parse_hint_arithmetic(hint_text: str):
+                if not hint_text:
+                    return None
+                # Extract a candidate arithmetic substring
+                candidates = re.findall(r"[\d\s\+\-\*/xX÷×\(\)]+", hint_text)
+                candidates = [c.strip() for c in candidates if c and any(op in c for op in ['+', '-', '*', 'x', 'X', '÷', '×', '/']) and re.search(r"\d", c)]
+                if not candidates:
+                    return None
+                # Choose the longest plausible candidate
+                expr = max(candidates, key=len)
+                expr_eval = _normalize_ops_for_eval(expr)
+                # Ensure only safe characters
+                if not re.fullmatch(r"[0-9\s\+\-\*/\(\)]+", expr_eval):
+                    return None
+                try:
+                    result = eval(expr_eval, {"__builtins__": None}, {})
+                except Exception:
+                    return None
+                if isinstance(result, float):
+                    # Only accept if integral
+                    if abs(result - round(result)) < 1e-9:
+                        result = int(round(result))
+                    else:
+                        return None
+                if not isinstance(result, int):
+                    return None
+                expr_display = _normalize_ops_for_display(expr)
+                return {"expr_display": expr_display, "result": result}
+
+            def gen_from_hint(parsed):
+                expr_display = parsed["expr_display"]
+                correct = parsed["result"]
+                q_text = f"Compute: {expr_display}"
+                distractors = set()
+                tweaks = [-2, -1, 1, 2, 3, -3]
+                while len(distractors) < 3:
+                    off = random.choice(tweaks)
+                    cand = correct + off
+                    if cand != correct:
+                        distractors.add(cand)
+                options = [str(correct)] + [str(x) for x in list(distractors)[:3]]
+                random.shuffle(options)
+                return {
+                    "id": 0,
+                    "type": "mcq",
+                    "question": q_text,
+                    "options": options,
+                    "answer": str(correct),
+                }
+
+            def generate_with_llm(ops_labels, level, combine, count, hint):
+                if not ops_labels:
+                    return None
+                # Map difficulty to constraints
+                if level == "Easy":
+                    range_text = "Use small integers, mostly 1-10."
+                elif level == "Medium":
+                    range_text = "Use integers roughly 5-50."
+                else:
+                    range_text = "Use integers roughly 10-100."
+
+                ops_text = ", ".join(ops_labels)
+                combine_text = (
+                    "Some questions should combine two selected operations in a single expression."
+                    if combine else
+                    "Use only a single operation per question."
+                )
+                style_text = f"Style hint: {hint.strip()}" if hint and hint.strip() else ""
+
+                system_message = (
+                    "You are a math question generator for school students. "
+                    f"Target grade: {self.grade}. Generate clear, unambiguous arithmetic MCQs."
+                )
+                user_prompt = f"""
+Generate exactly {count} multiple-choice math questions.
+Operations allowed: {ops_text}.
+{combine_text}
+Difficulty guideline: {range_text}
+{style_text}
+
+Rules:
+- Each question must be arithmetic with an integer correct answer.
+- Provide exactly 4 options; ensure only ONE option is correct, others are plausible.
+- Keep numbers manageable; avoid fractions and decimals; if division appears, make it exact.
+- Return ONLY valid JSON in this exact shape:
+[
+  {{"id": 1, "type": "mcq", "question": "...", "options": ["...","...","...","..."], "answer": "..."}}
+]
+                """
+
+                try:
+                    resp = self.client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[
+                            {"role": "system", "content": system_message},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                    )
+                    parsed = self.clean_json(resp.choices[0].message.content)
+                    # basic sanity check
+                    if isinstance(parsed, list) and all(isinstance(x, dict) for x in parsed):
+                        # Normalize ids sequentially
+                        for i, qd in enumerate(parsed, start=1):
+                            qd["id"] = i
+                            qd["type"] = "mcq"
+                        return parsed
+                    return None
+                except Exception as e:
+                    st.error(f"LLM error: {e}")
+                    return None
+
+            if st.button("Generate Math Questions"):
+                if not ops:
+                    st.warning("Please select at least one operation.")
+                else:
+                    if generator_mode == "Local (offline)":
+                        items = []
+                        parsed_hint = parse_hint_arithmetic(style_hint)
+                        for i in range(math_num_questions):
+                            if i == 0 and parsed_hint is not None:
+                                qd = gen_from_hint(parsed_hint)
+                            else:
+                                qd = gen_single(ops, difficulty, combine_ops, style_hint)
+                            qd["id"] = i + 1
+                            items.append(qd)
+                        st.session_state.math_questions = items
+                    else:
+                        llm_items = generate_with_llm(ops, difficulty, combine_ops, math_num_questions, style_hint)
+                        if llm_items:
+                            st.session_state.math_questions = llm_items
+                        else:
+                            st.error("❌ Failed to generate questions with LLM. Try adjusting options or use Local mode.")
+
+            # Display math questions
+            if "math_questions" in st.session_state:
+                st.markdown("### 📌 Math Questions")
+                for q in st.session_state.math_questions:
+                    with st.container():
+                        st.markdown(f"**Q{q['id']}: {q['question']}**")
+                        selected_key = f"math_answer_{q['id']}"
+                        st.radio(
+                            label="",
+                            options=q.get("options", []),
+                            key=selected_key,
+                            label_visibility="collapsed",
+                        )
+                        if st.button(f"✅ Check Answer Q{q['id']}", key=f"check_math_{q['id']}"):
+                            chosen = st.session_state.get(selected_key, None)
+                            if chosen is None:
+                                st.warning("⚠️ Please select an answer first.")
+                            else:
+                                is_correct, explanation, resolved = self._mcq_check_and_explain(chosen, q)
+                                if is_correct:
+                                    st.success("✅ Correct!")
+                                else:
+                                    st.error(f"❌ Incorrect! Correct answer: {resolved.get('expected_text')}")
+                                with st.expander("See validation details"):
+                                    st.markdown(explanation)
 
 
 if __name__ == "__main__":
